@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EnvLogger Viewer</title>
+<style>
+  :root { --bg:#fff0f6; --card:#ffd6e7; --ink:#4a1a2c; --sub:#8a4a62; --accent:#e8508a; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#241420; --card:#3a2132; --ink:#ffe6f0; --sub:#d9a3bb; --accent:#ff7ab0; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:12px; background:var(--bg); color:var(--ink);
+         font-family: system-ui, -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; }
+  h1 { font-size:18px; margin:0 0 8px; }
+  .bar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:10px; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:8px 14px; font-size:15px; }
+  button.sub { background:var(--card); color:var(--ink); }
+  button:disabled { opacity:.5; }
+  #status { color:var(--sub); font-size:13px; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .card { background:var(--card); border-radius:10px; padding:8px 10px; }
+  .card.wide { grid-column:1 / -1; }
+  .label { font-size:12px; color:var(--sub); }
+  .val { font-size:26px; font-weight:600; }
+  .unit { font-size:13px; color:var(--sub); margin-left:2px; }
+  .big { font-size:44px; }
+  canvas { width:100%; height:110px; display:block; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body>
+<h1>EnvLogger Viewer</h1>
+<div class="bar">
+  <button id="btnConn">接続</button>
+  <button id="btnCsv" class="sub" disabled>CSV保存</button>
+  <span id="status">未接続</span>
+</div>
+
+<div class="grid">
+  <div class="card wide"><div class="label">速度</div><div><span class="val big" id="spd">--</span><span class="unit">km/h</span></div></div>
+  <div class="card"><div class="label">気温</div><div><span class="val" id="temp">--</span><span class="unit">°C</span></div></div>
+  <div class="card"><div class="label">湿度</div><div><span class="val" id="hum">--</span><span class="unit">%</span></div></div>
+  <div class="card"><div class="label">気圧</div><div><span class="val" id="pres">--</span><span class="unit">hPa</span></div></div>
+  <div class="card"><div class="label">TVOC</div><div><span class="val" id="tvoc">--</span><span class="unit">ppb</span></div></div>
+  <div class="card"><div class="label">標高</div><div><span class="val" id="alt">--</span><span class="unit">m</span></div></div>
+  <div class="card"><div class="label">照度</div><div><span class="val" id="lux">--</span><span class="unit">lx</span></div></div>
+  <div class="card"><div class="label">衛星 / HDOP / Fix</div><div><span class="val" id="gps">--</span></div></div>
+  <div class="card"><div class="label">距離 / 方位</div><div><span class="val" id="dist">--</span></div></div>
+  <div class="card wide"><div class="label">位置</div><div id="loc">--</div><div class="label" id="time"></div></div>
+</div>
+
+<div class="grid" style="margin-top:8px">
+  <div class="card wide"><div class="label">速度 km/h</div><canvas id="cSpd"></canvas></div>
+  <div class="card wide"><div class="label">気温 °C</div><canvas id="cTemp"></canvas></div>
+  <div class="card wide"><div class="label">湿度 %</div><canvas id="cHum"></canvas></div>
+  <div class="card wide"><div class="label">気圧 hPa</div><canvas id="cPres"></canvas></div>
+  <div class="card wide"><div class="label">TVOC ppb</div><canvas id="cTvoc"></canvas></div>
+  <div class="card wide"><div class="label">標高 m</div><canvas id="cAlt"></canvas></div>
+</div>
+
+<script>
+// ---- ESP32側(EnvLogger_v4e.ino)と合わせること ----
+const SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const TX_CHAR = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+const NAME_PREFIX = 'EnvLogger';
+const MAX_POINTS = 600;
+
+const $ = id => document.getElementById(id);
+const hist = { spd: [], temp: [], hum: [], pres: [], tvoc: [], alt: [] };
+const rows = [];            // CSV用 (SDログと同じ形式, 5秒ごと)
+let lastRecDt = '';         // 最後にCSVへ記録した日時 (重複防止)
+let device = null, rxBuf = '';
+const decoder = new TextDecoder();
+
+function setStatus(t) { $('status').textContent = t; }
+
+let manualDisconnect = false;   // 自分で切断ボタンを押したか
+let retryTimer = null;          // 再接続待ちタイマー
+let wakeLock = null;
+
+// ---- 画面スリープ防止 ----
+async function acquireWake() {
+  try {
+    if ('wakeLock' in navigator && !wakeLock) {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => { wakeLock = null; });
+    }
+  } catch (e) { /* 非対応・拒否は無視 */ }
+}
+function releaseWake() {
+  if (wakeLock) { wakeLock.release(); wakeLock = null; }
+}
+// タブが裏に回ると自動解除されるので、戻ってきたら取り直す
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && device && !manualDisconnect) acquireWake();
+});
+
+// ---- 接続 ----
+async function connectGatt() {
+  setStatus('接続中...');
+  const server = await device.gatt.connect();
+  const svc = await server.getPrimaryService(SERVICE);
+  const ch = await svc.getCharacteristic(TX_CHAR);
+  ch.addEventListener('characteristicvaluechanged', onData);
+  setStatus('購読中... (PIN入力が出たら入力)');
+  await ch.startNotifications();     // ここでペアリング(PIN入力)が走る
+  rxBuf = '';
+  $('btnConn').textContent = '切断';
+  $('btnCsv').disabled = false;
+  setStatus('接続済み: ' + device.name);
+  acquireWake();
+}
+
+async function connect() {
+  if (!navigator.bluetooth) {
+    setStatus('このブラウザはWeb Bluetooth非対応 (Android版Chromeを使用)');
+    return;
+  }
+  manualDisconnect = false;
+  try {
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: NAME_PREFIX }],
+      optionalServices: [SERVICE]
+    });
+    device.addEventListener('gattserverdisconnected', onDisconnected);
+    await connectGatt();
+  } catch (e) {
+    setStatus('失敗: ' + e.message);
+  }
+}
+
+// 切断されたら3秒おきに自動で再接続を試す (同じdeviceなら選択ダイアログは出ない)
+function scheduleRetry() {
+  clearTimeout(retryTimer);
+  retryTimer = setTimeout(async () => {
+    retryTimer = null;
+    if (manualDisconnect || !device) return;
+    try {
+      await connectGatt();
+    } catch (e) {
+      setStatus('再接続失敗 (' + e.message + ') リトライ中...');
+      scheduleRetry();
+    }
+  }, 3000);
+}
+
+function onDisconnected() {
+  if (manualDisconnect) {
+    setStatus('切断しました');
+    $('btnConn').textContent = '接続';
+    return;
+  }
+  setStatus('切断されました。再接続待ち...');
+  $('btnConn').textContent = '切断';   // 再接続を止めたいとき用
+  scheduleRetry();
+}
+
+function disconnect() {
+  manualDisconnect = true;
+  clearTimeout(retryTimer); retryTimer = null;
+  releaseWake();
+  if (device && device.gatt.connected) device.gatt.disconnect();
+  else onDisconnected();
+}
+
+function onData(ev) {
+  rxBuf += decoder.decode(ev.target.value);
+  let i;
+  while ((i = rxBuf.indexOf('\n')) >= 0) {
+    const line = rxBuf.slice(0, i).trim();
+    rxBuf = rxBuf.slice(i + 1);
+    if (line) handleLine(line);
+  }
+}
+
+function push(key, v) {
+  if (!isFinite(v)) return;
+  const a = hist[key];
+  a.push(v);
+  if (a.length > MAX_POINTS) a.shift();
+}
+
+function handleLine(line) {
+  const f = line.split(',');
+  if (f[0] === 'V') {                       // 速度だけ高速更新
+    const v = parseFloat(f[1]);
+    if (isFinite(v)) { $('spd').textContent = v.toFixed(0); push('spd', v); drawAll(); }
+    return;
+  }
+  if (f[0] !== 'D' || f.length < 16) return;
+  const [, dt, temp, hum, pres, tvoc, lux, alt, spd, lat, lng, sat, hdop, fix, dist, course] = f;
+  const n = parseFloat;
+  $('temp').textContent = isFinite(n(temp)) ? n(temp).toFixed(1) : '--';
+  $('hum').textContent  = isFinite(n(hum))  ? n(hum).toFixed(1)  : '--';
+  $('pres').textContent = isFinite(n(pres)) ? n(pres).toFixed(1) : '--';
+  $('tvoc').textContent = tvoc;
+  $('alt').textContent  = isFinite(n(alt)) ? n(alt).toFixed(0) : '--';
+  $('lux').textContent  = lux === '' ? '--' : n(lux).toFixed(1);
+  $('spd').textContent  = isFinite(n(spd)) ? n(spd).toFixed(0) : '--';
+  const fixTxt = fix === '3' ? '3D' : fix === '2' ? '2D' : 'No fix';
+  $('gps').textContent  = `${sat} / ${n(hdop).toFixed(1)} / ${fixTxt}`;
+  $('dist').textContent = `${n(dist).toFixed(1)}km / ${n(course).toFixed(0)}°`;
+  $('time').textContent = dt;
+  if (fix !== '0') {
+    $('loc').innerHTML = `<a href="https://www.google.com/maps?q=${lat},${lng}" target="_blank" rel="noopener">${n(lat).toFixed(6)}, ${n(lng).toFixed(6)}</a>`;
+  } else {
+    $('loc').textContent = '測位待ち';
+  }
+  push('temp', n(temp)); push('hum', n(hum)); push('pres', n(pres)); push('tvoc', n(tvoc)); push('alt', n(alt)); push('spd', n(spd));
+  // CSVへの記録は5秒ごと(SDログと同じ 秒%5==0)。画面表示は1秒ごとのまま
+  if (parseInt(dt.slice(17, 19), 10) % 5 === 0 && dt !== lastRecDt) {
+    lastRecDt = dt;
+    rows.push(toSdRow(f));
+  }
+  drawAll();
+}
+
+// ---- グラフ ----
+function drawChart(cv, data, color) {
+  const dpr = window.devicePixelRatio || 1;
+  const W = cv.clientWidth * dpr, H = cv.clientHeight * dpr;
+  if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
+  const ctx = cv.getContext('2d');
+  ctx.clearRect(0, 0, W, H);
+  if (data.length < 2) return;
+  let mn = Math.min(...data), mx = Math.max(...data);
+  if (mx - mn < 0.5) { mx += 0.25; mn -= 0.25; }
+  const pad = 14 * dpr;
+  ctx.strokeStyle = color; ctx.lineWidth = 2 * dpr; ctx.beginPath();
+  data.forEach((v, i) => {
+    const x = (i / (data.length - 1)) * W;
+    const y = H - pad - ((v - mn) / (mx - mn)) * (H - pad * 2);
+    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+  });
+  ctx.stroke();
+  ctx.fillStyle = getComputedStyle(document.body).color;
+  ctx.font = `${11 * dpr}px sans-serif`;
+  ctx.fillText(mx.toFixed(1), 4 * dpr, 11 * dpr);
+  ctx.fillText(mn.toFixed(1), 4 * dpr, H - 3 * dpr);
+}
+
+function drawAll() {
+  const c = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim();
+  drawChart($('cSpd'),  hist.spd,  c);
+  drawChart($('cTemp'), hist.temp, c);
+  drawChart($('cHum'),  hist.hum,  c);
+  drawChart($('cPres'), hist.pres, c);
+  drawChart($('cTvoc'), hist.tvoc, c);
+  drawChart($('cAlt'),  hist.alt,  c);
+}
+
+// ---- CSV保存 (SDカードのログと同じ列・書式。末尾に dist_km を追加) ----
+// ESP32側 writeLog() と同じ: lat/lng %.6f, alt %.1f, spd %.1f, temp %.2f, hum %.1f, pres %.1f,
+// tvoc 整数, lux %.3f (無ければ空), 衛星数, hdop %.1f, fix 文字列。温湿度・気圧が取れないときは0
+function toSdRow(f) {
+  const [, dt, temp, hum, pres, tvoc, lux, alt, spd, lat, lng, sat, hdop, fix, dist] = f;
+  const num = (v, d) => { const x = parseFloat(v); return (isFinite(x) ? x : 0).toFixed(d); };
+  const fixTxt = fix === '3' ? '3D Fix' : fix === '2' ? '2D Fix' : 'No fix';
+  const luxTxt = isFinite(parseFloat(lux)) ? parseFloat(lux).toFixed(3) : '';
+  return [dt, num(lat, 6), num(lng, 6), num(alt, 1), num(spd, 1),
+          num(temp, 2), num(hum, 1), num(pres, 1), parseInt(tvoc, 10) || 0, luxTxt,
+          parseInt(sat, 10) || 0, num(hdop, 1), fixTxt, num(dist, 2)].join(',');
+}
+
+function saveCsv() {
+  const head = 'datetime,latitude,longitude,alt_m,spd_kmh,temp_C,hum_pct,pres_hPa,tvoc_ppb,lux,satellites,hdop,fix,dist_km\n';
+  const blob = new Blob([head + rows.join('\n') + '\n'], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'envlogger_' + new Date().toISOString().replace(/[:.]/g, '-') + '.csv';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+$('btnConn').addEventListener('click', () => {
+  if (device && (device.gatt.connected || retryTimer || $('btnConn').textContent === '切断')) disconnect(); else connect();
+});
+$('btnCsv').addEventListener('click', saveCsv);
+window.addEventListener('resize', drawAll);
+</script>
+</body>
+</html>
