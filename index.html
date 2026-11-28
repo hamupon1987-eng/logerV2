@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>EnvLogger Viewer</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <style>
   :root { --bg:#fff0f6; --card:#ffd6e7; --ink:#4a1a2c; --sub:#8a4a62; --accent:#e8508a; }
   @media (prefers-color-scheme: dark) {
@@ -13,6 +14,7 @@
   body { margin:0; padding:12px; background:var(--bg); color:var(--ink);
          font-family: system-ui, -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; }
   h1 { font-size:18px; margin:0 0 8px; }
+  h2 { font-size:15px; margin:18px 0 6px; }
   .bar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:10px; }
   button { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:8px 14px; font-size:15px; }
   button.sub { background:var(--card); color:var(--ink); }
@@ -25,10 +27,24 @@
   .val { font-size:26px; font-weight:600; }
   .unit { font-size:13px; color:var(--sub); margin-left:2px; }
   .big { font-size:44px; }
-  canvas { width:100%; height:150px; display:block; }
+  .stats .val { font-size:20px; }
+  canvas { width:100%; height:150px; display:block; touch-action:pan-y; }
+  #map { height:300px; border-radius:8px; z-index:0; background:#ddd; color:#555; font-size:13px; }
   .rng button { padding:6px 10px; font-size:14px; background:var(--card); color:var(--ink); }
   .rng button.on { background:var(--accent); color:#fff; }
   a { color:var(--accent); }
+  .eco-only { display:none; }
+
+  /* 省電力表示: 真っ黒な背景 + 暗めの文字 (有機ELで消費電力が下がる) */
+  body.eco { background:#000; color:#9a9a9a; }
+  body.eco .card { background:#000; border:1px solid #262626; }
+  body.eco .label, body.eco .unit, body.eco #status { color:#666; }
+  body.eco .val { color:#cfcfcf; }
+  body.eco .big { font-size:64px; }
+  body.eco button, body.eco button.sub { background:#1c1c1c; color:#9a9a9a; }
+  body.eco a { color:#9a9a9a; }
+  body.eco #detail { display:none; }
+  body.eco .eco-only { display:block; }
 </style>
 </head>
 <body>
@@ -36,8 +52,12 @@
 <div class="bar">
   <button id="btnConn">接続</button>
   <button id="btnCsv" class="sub" disabled>CSV保存</button>
+  <button id="btnEco" class="sub">省電力表示</button>
   <span id="status">未接続</span>
 </div>
+<div class="label" id="wake" style="margin:-4px 0 4px"></div>
+<div class="label" id="bfInfo" style="margin:0 0 8px"></div>
+<div class="label eco-only" style="margin-bottom:8px">省電力表示中: グラフ・地図は止めています。スマホの明るさを最低にするとさらに省電力になります。</div>
 
 <div class="grid">
   <div class="card wide"><div class="label">速度</div><div><span class="val big" id="spd">--</span><span class="unit">km/h</span></div></div>
@@ -52,76 +72,260 @@
   <div class="card wide"><div class="label">位置</div><div id="loc">--</div><div class="label" id="time"></div></div>
 </div>
 
-<div class="bar rng" id="rangeBar" style="margin-top:12px"></div>
-<div class="grid">
-  <div class="card wide"><div class="label">速度 km/h</div><canvas id="cSpd"></canvas></div>
-  <div class="card wide"><div class="label">気温 °C</div><canvas id="cTemp"></canvas></div>
-  <div class="card wide"><div class="label">湿度 %</div><canvas id="cHum"></canvas></div>
-  <div class="card wide"><div class="label">気圧 hPa</div><canvas id="cPres"></canvas></div>
-  <div class="card wide"><div class="label">TVOC ppb</div><canvas id="cTvoc"></canvas></div>
-  <div class="card wide"><div class="label">標高 m</div><canvas id="cAlt"></canvas></div>
+<div id="detail">
+  <div class="bar rng" id="rangeBar" style="margin-top:14px"></div>
+
+  <h2>グラフ <span class="label">(タップ / なぞると値を表示)</span></h2>
+  <div class="grid">
+    <div class="card wide"><div class="label">速度 km/h</div><canvas id="cSpd"></canvas></div>
+    <div class="card wide"><div class="label">気温 °C</div><canvas id="cTemp"></canvas></div>
+    <div class="card wide"><div class="label">湿度 %</div><canvas id="cHum"></canvas></div>
+    <div class="card wide"><div class="label">気圧 hPa</div><canvas id="cPres"></canvas></div>
+    <div class="card wide"><div class="label">TVOC ppb</div><canvas id="cTvoc"></canvas></div>
+    <div class="card wide"><div class="label">標高 m</div><canvas id="cAlt"></canvas></div>
+  </div>
+
+  <h2>集計 <span class="label" id="statsTitle"></span></h2>
+  <div class="grid stats" id="stats"></div>
+
+  <h2>走行ルート</h2>
+  <div class="card wide">
+    <div class="bar" style="margin-bottom:8px">
+      <button id="btnFollow" class="sub">追従: ON</button>
+      <button id="btnFit" class="sub">全体表示</button>
+    </div>
+    <div id="map">地図を準備中...</div>
+    <div class="label" style="margin-top:4px">地図: © OpenStreetMap contributors (オンライン時のみ表示)</div>
+  </div>
+
+  <div class="bar" style="margin-top:14px">
+    <button id="btnClear" class="sub">履歴クリア</button>
+    <span class="label">履歴はこのブラウザ内に最大12時間分を自動保存します</span>
+  </div>
 </div>
 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
-// ---- ESP32側(EnvLogger_v4e.ino)と合わせること ----
+// ============================================================
+//  設定 (ESP32側 EnvLogger_v4e.ino と合わせること)
+// ============================================================
 const SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
-const TX_CHAR = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+const TX_CHAR = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';   // ESP32 -> スマホ (Notify)
+const RX_CHAR = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';   // スマホ -> ESP32 (Write: 履歴補完の要求)
 const NAME_PREFIX = 'EnvLogger';
-const MAX_AGE_MS = 6 * 3600e3 + 600e3;   // 6時間+余裕ぶんだけ保持
-const GAP_MS = 5000;                      // これ以上データが空いたら線を切る
+const MAX_AGE_MS = 12 * 3600e3;   // 履歴を保持する期間
+const GAP_MS = 12e3;              // これ以上データが空いたらグラフの線を切る (1Hzライブと5秒SDログの両方を連続扱い)
+const TRK_GAP_MS = 120e3;         // 軌跡の線を切る間隔
+const ML = 42, MR = 10;           // グラフの左右余白 (CSS px)
 
 const $ = id => document.getElementById(id);
+const p2 = v => String(v).padStart(2, '0');
+
+// ==== PURE START (DOMに依存しない処理) ====
 const SERIES = ['spd', 'temp', 'hum', 'pres', 'tvoc', 'alt'];
+
+function lowerBound(arr, x) {
+  let lo = 0, hi = arr.length;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (arr[mid] < x) lo = mid + 1; else hi = mid; }
+  return lo;
+}
+
+// 時刻はすべて「ESP32のJST時刻をそのままUTC扱いにしたms」で持つ (端末のタイムゾーンに依存しない)
+const DT_RE = /^(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)$/;
+function parseDev(s) {
+  const m = DT_RE.exec(s);
+  return m ? Date.UTC(+m[1], m[2] - 1, +m[3], +m[4], +m[5], +m[6]) : NaN;
+}
+function fmtDev(ms) {
+  const d = new Date(ms);
+  return d.getUTCFullYear() + '-' + p2(d.getUTCMonth() + 1) + '-' + p2(d.getUTCDate()) + ' ' +
+         p2(d.getUTCHours()) + ':' + p2(d.getUTCMinutes()) + ':' + p2(d.getUTCSeconds());
+}
+function fmtCompact(ms) {   // YYMMDDhhmmss (ESP32への要求用。BLEの1パケットに収めるため短くする)
+  const d = new Date(ms);
+  return p2(d.getUTCFullYear() % 100) + p2(d.getUTCMonth() + 1) + p2(d.getUTCDate()) +
+         p2(d.getUTCHours()) + p2(d.getUTCMinutes()) + p2(d.getUTCSeconds());
+}
+
+function distM(lat1, lng1, lat2, lng2) {   // 近距離用の簡易距離 (m)
+  const dx = (lng2 - lng1) * Math.cos((lat1 + lat2) * Math.PI / 360) * 111320;
+  const dy = (lat2 - lat1) * 110540;
+  return Math.hypot(dx, dy);
+}
+
+// 列指向ストア {t:[], k1:[], ...} に、時刻順を保ったまま重複なしで追加する
+function mergeSOA(store, keys, recs) {
+  if (!recs.length) return;
+  const have = new Set(store.t);
+  const add = recs.filter(r => !have.has(r.t));
+  if (!add.length) return;
+  const all = [];
+  for (let i = 0; i < store.t.length; i++) {
+    const o = { t: store.t[i] };
+    for (const k of keys) o[k] = store[k][i];
+    all.push(o);
+  }
+  for (const r of add) all.push(r);
+  all.sort((a, b) => a.t - b.t);
+  store.t = all.map(o => o.t);
+  for (const k of keys) store[k] = all.map(o => o[k]);
+}
+
+function trimStore(store, keys, cut) {
+  const k = lowerBound(store.t, cut);
+  if (k > 0) { store.t.splice(0, k); for (const key of keys) store[key].splice(0, k); }
+}
+
+// 軌跡の長さ (km)。3m未満の細かい揺れは無視し、途切れた区間はつながない
+function trackLengthKm(trk, t0, t1) {
+  let la = null, ln = null, lt = null, sum = 0;
+  for (let i = lowerBound(trk.t, t0); i < trk.t.length && trk.t[i] <= t1; i++) {
+    const lat = trk.lat[i], lng = trk.lng[i], t = trk.t[i];
+    if (la === null || t - lt > TRK_GAP_MS) { la = lat; ln = lng; lt = t; continue; }
+    const d = distM(la, ln, lat, lng);
+    if (d >= 3) { sum += d; la = lat; ln = lng; }
+    lt = t;
+  }
+  return sum / 1000;
+}
+
+function niceStep(raw) {
+  const p = Math.pow(10, Math.floor(Math.log10(raw)));
+  const m = raw / p;
+  return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * p;
+}
+
+function fmtDur(ms) {
+  const h = Math.floor(ms / 3.6e6), m = Math.floor(ms % 3.6e6 / 6e4), s = Math.floor(ms % 6e4 / 1e3);
+  return h > 0 ? `${h}時間${m}分` : m > 0 ? `${m}分${s}秒` : `${s}秒`;
+}
+// ==== PURE END ====
+
+// ============================================================
+//  データ (列指向。時刻 t は上記のデバイス時刻ms)
+// ============================================================
 const hist = { t: [], spd: [], temp: [], hum: [], pres: [], tvoc: [], alt: [] };
-const rows = [];            // CSV用 (SDログと同じ形式, 5秒ごと)
-let lastRecDt = '';         // 最後にCSVへ記録した日時 (重複防止)
-let device = null, rxBuf = '';
-const decoder = new TextDecoder();
+const trk  = { t: [], lat: [], lng: [], spd: [] };    // 走行軌跡 (2m以上動いた点 + 30秒ごと)
+const rows = { t: [], s: [] };                        // CSV行 (SDログと同じ書式, 5秒ごと)
 
-function setStatus(t) { $('status').textContent = t; }
+let anchorDev = null, anchorArr = 0;   // 直近のライブ受信時刻 (デバイス時刻と端末時刻の対応)
+function lastT() { return hist.t.length ? hist.t[hist.t.length - 1] : -Infinity; }
+function nowDev() {
+  if (anchorDev !== null) return anchorDev + (Date.now() - anchorArr);
+  return hist.t.length ? hist.t[hist.t.length - 1] : Date.now() + 9 * 3600e3;
+}
 
-let manualDisconnect = false;   // 自分で切断ボタンを押したか
-let retryTimer = null;          // 再接続待ちタイマー
+let dirty = false, mapDirty = true, eco = false;
+let rangeMs = 300e3;
+
+function clearStore(st) { for (const k of Object.keys(st)) st[k] = []; }
+function resetData() { clearStore(hist); clearStore(trk); clearStore(rows); anchorDev = null; dirty = true; mapDirty = true; }
+
+// ============================================================
+//  自動保存 (IndexedDB)
+// ============================================================
+function idbOpen() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open('envlogger', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('kv');
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+async function saveState() {
+  if (!dirty) return;
+  dirty = false;
+  try {
+    const db = await idbOpen();
+    await new Promise((res, rej) => {
+      const tx = db.transaction('kv', 'readwrite');
+      tx.objectStore('kv').put({ hist, trk, rows, savedAt: Date.now() }, 'state');
+      tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+    });
+    db.close();
+  } catch (e) { dirty = true; }
+}
+function restore(dst, src) {
+  if (!src) return;
+  const keys = Object.keys(dst);
+  const n = (src.t || []).length;
+  if (!keys.every(k => Array.isArray(src[k]) && src[k].length === n)) return;   // 壊れていたら読まない
+  for (const k of keys) dst[k] = src[k];
+}
+async function loadState() {
+  try {
+    const db = await idbOpen();
+    const s = await new Promise((res, rej) => {
+      const r = db.transaction('kv').objectStore('kv').get('state');
+      r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+    });
+    db.close();
+    if (s) { restore(hist, s.hist); restore(trk, s.trk); restore(rows, s.rows); }
+  } catch (e) { /* 保存なし or 非対応 */ }
+}
+async function deleteSaved() {
+  try {
+    const db = await idbOpen();
+    await new Promise((res, rej) => {
+      const tx = db.transaction('kv', 'readwrite');
+      tx.objectStore('kv').delete('state');
+      tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+    });
+    db.close();
+  } catch (e) { /* 無視 */ }
+}
+
+// ============================================================
+//  画面スリープ防止
+// ============================================================
 let wakeLock = null;
-
-// ---- 画面スリープ防止 ----
+function setWake(t) { $('wake').textContent = '画面ON維持: ' + t; }
 async function acquireWake() {
   try {
-    if ('wakeLock' in navigator && !wakeLock) {
+    if (!('wakeLock' in navigator)) { setWake('このブラウザは非対応'); return; }
+    if (!wakeLock) {
       wakeLock = await navigator.wakeLock.request('screen');
-      wakeLock.addEventListener('release', () => { wakeLock = null; });
+      wakeLock.addEventListener('release', () => { wakeLock = null; setWake('解除された'); });
+      setWake('有効');
     }
-  } catch (e) { /* 非対応・拒否は無視 */ }
+  } catch (e) {
+    setWake('失敗 (' + (e.name || '') + ') 省電力モードを切って試す');
+  }
 }
-function releaseWake() {
-  if (wakeLock) { wakeLock.release(); wakeLock = null; }
-}
-// タブが裏に回ると自動解除されるので、戻ってきたら取り直す
+function releaseWake() { if (wakeLock) { wakeLock.release(); wakeLock = null; } }
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && device && !manualDisconnect) acquireWake();
+  if (document.visibilityState === 'hidden') saveState();
 });
+window.addEventListener('pagehide', saveState);
 
-// ---- 接続 ----
+// ============================================================
+//  BLE接続 (自動再接続つき)
+// ============================================================
+let device = null, rxChar = null, rxBuf = '';
+let manualDisconnect = false, retryTimer = null;
+let needBackfill = false, bfRows = [];
+const decoder = new TextDecoder();
+function setStatus(t) { $('status').textContent = t; }
+
 async function connectGatt() {
   setStatus('接続中...');
   const server = await device.gatt.connect();
   const svc = await server.getPrimaryService(SERVICE);
   const ch = await svc.getCharacteristic(TX_CHAR);
+  try { rxChar = await svc.getCharacteristic(RX_CHAR); } catch (e) { rxChar = null; }   // 古いスケッチ用
   ch.addEventListener('characteristicvaluechanged', onData);
   setStatus('購読中... (PIN入力が出たら入力)');
-  await ch.startNotifications();     // ここでペアリング(PIN入力)が走る
+  await ch.startNotifications();
   rxBuf = '';
+  needBackfill = true;          // 最初のライブ行を受信したら、途切れた分をSDから補完する
   $('btnConn').textContent = '切断';
-  $('btnCsv').disabled = false;
   setStatus('接続済み: ' + device.name);
   acquireWake();
 }
 
 async function connect() {
-  if (!navigator.bluetooth) {
-    setStatus('このブラウザはWeb Bluetooth非対応 (Android版Chromeを使用)');
-    return;
-  }
+  if (!navigator.bluetooth) { setStatus('このブラウザはWeb Bluetooth非対応 (Android版Chromeを使用)'); return; }
   manualDisconnect = false;
   try {
     device = await navigator.bluetooth.requestDevice({
@@ -130,43 +334,29 @@ async function connect() {
     });
     device.addEventListener('gattserverdisconnected', onDisconnected);
     await connectGatt();
-  } catch (e) {
-    setStatus('失敗: ' + e.message);
-  }
+  } catch (e) { setStatus('失敗: ' + e.message); }
 }
 
-// 切断されたら3秒おきに自動で再接続を試す (同じdeviceなら選択ダイアログは出ない)
 function scheduleRetry() {
   clearTimeout(retryTimer);
   retryTimer = setTimeout(async () => {
     retryTimer = null;
     if (manualDisconnect || !device) return;
-    try {
-      await connectGatt();
-    } catch (e) {
-      setStatus('再接続失敗 (' + e.message + ') リトライ中...');
-      scheduleRetry();
-    }
+    try { await connectGatt(); }
+    catch (e) { setStatus('再接続失敗 (' + e.message + ') リトライ中...'); scheduleRetry(); }
   }, 3000);
 }
-
 function onDisconnected() {
-  if (manualDisconnect) {
-    setStatus('切断しました');
-    $('btnConn').textContent = '接続';
-    return;
-  }
+  if (manualDisconnect) { setStatus('切断しました'); $('btnConn').textContent = '接続'; return; }
   setStatus('切断されました。再接続待ち...');
-  $('btnConn').textContent = '切断';   // 再接続を止めたいとき用
+  $('btnConn').textContent = '切断';
   scheduleRetry();
 }
-
 function disconnect() {
   manualDisconnect = true;
   clearTimeout(retryTimer); retryTimer = null;
   releaseWake();
-  if (device && device.gatt.connected) device.gatt.disconnect();
-  else onDisconnected();
+  if (device && device.gatt.connected) device.gatt.disconnect(); else onDisconnected();
 }
 
 function onData(ev) {
@@ -179,25 +369,36 @@ function onData(ev) {
   }
 }
 
-// 受信した瞬間のスマホ時刻と一緒に1秒ごとのデータを履歴へ追加
-function addPoint(p) {
-  const now = Date.now();
-  hist.t.push(now);
-  for (const k of SERIES) hist[k].push(Number.isFinite(p[k]) ? p[k] : NaN);
-  const cut = now - MAX_AGE_MS;
-  let k = 0;
-  while (k < hist.t.length && hist.t[k] < cut) k++;
-  if (k > 1000) for (const key of ['t', ...SERIES]) hist[key].splice(0, k);
+// ESP32へ「この時刻より後のSDログを送って」と要求する
+async function requestBackfill(tNow, last) {
+  if (!rxChar) { $('bfInfo').textContent = 'ESP32側が履歴補完に未対応です (スケッチを更新してください)'; return; }
+  const since = Number.isFinite(last) ? Math.max(last, tNow - MAX_AGE_MS) : tNow - 6 * 3600e3;
+  try {
+    bfRows = [];
+    $('bfInfo').textContent = '履歴を補完中...';
+    const data = new TextEncoder().encode('B,' + fmtCompact(since));
+    if (rxChar.writeValueWithResponse) await rxChar.writeValueWithResponse(data);
+    else await rxChar.writeValue(data);
+  } catch (e) { $('bfInfo').textContent = '履歴補完の要求に失敗: ' + e.message; }
 }
 
 function handleLine(line) {
   const f = line.split(',');
-  if (f[0] === 'V') {                       // 速度だけ高速更新
-    const v = parseFloat(f[1]);
-    if (isFinite(v)) $('spd').textContent = v.toFixed(0);
-    return;
+  switch (f[0]) {
+    case 'V': {                                   // 速度だけ高速更新
+      const v = parseFloat(f[1]);
+      if (isFinite(v)) $('spd').textContent = v.toFixed(0);
+      break;
+    }
+    case 'D': onLive(f); break;
+    case 'R': onBackfillLine(f); break;
+    case 'E': finishBackfill(parseInt(f[1], 10) || 0); break;
   }
-  if (f[0] !== 'D' || f.length < 16) return;
+}
+
+// ---- ライブ行 (1秒ごと) ----
+function onLive(f) {
+  if (f.length < 16) return;
   const [, dt, temp, hum, pres, tvoc, lux, alt, spd, lat, lng, sat, hdop, fix, dist, course] = f;
   const n = parseFloat;
   $('temp').textContent = isFinite(n(temp)) ? n(temp).toFixed(1) : '--';
@@ -213,59 +414,132 @@ function handleLine(line) {
   $('time').textContent = dt;
   if (fix !== '0') {
     $('loc').innerHTML = `<a href="https://www.google.com/maps?q=${lat},${lng}" target="_blank" rel="noopener">${n(lat).toFixed(6)}, ${n(lng).toFixed(6)}</a>`;
-  } else {
-    $('loc').textContent = '測位待ち';
+  } else { $('loc').textContent = '測位待ち'; }
+
+  const t = parseDev(dt);
+  if (!Number.isFinite(t)) return;
+  anchorDev = t; anchorArr = Date.now();
+
+  let last = lastT();
+  if (t < last - 120e3) { resetData(); last = -Infinity; }        // ESP32の時計が大きく巻き戻った (GPS同期など)
+  if (needBackfill) { needBackfill = false; requestBackfill(t, last); }   // 追加前の最後の時刻から補完
+  if (t <= last) return;
+
+  hist.t.push(t);
+  hist.spd.push(n(spd)); hist.temp.push(n(temp)); hist.hum.push(n(hum));
+  hist.pres.push(n(pres)); hist.tvoc.push(n(tvoc)); hist.alt.push(n(alt));
+  for (const k of SERIES) if (!Number.isFinite(hist[k][hist[k].length - 1])) hist[k][hist[k].length - 1] = NaN;
+
+  if (fix !== '0' && Math.abs(n(lat)) > 1e-4 && n(hdop) <= 5) addTrack(t, n(lat), n(lng), n(spd));
+  if ((t / 1000) % 5 === 0 && (!rows.t.length || t > rows.t[rows.t.length - 1])) {   // SDログと同じ5秒ごと
+    rows.t.push(t); rows.s.push(toSdRow(f));
+    $('btnCsv').disabled = false;
   }
-  addPoint({ temp: n(temp), hum: n(hum), pres: n(pres), tvoc: n(tvoc), alt: n(alt), spd: n(spd) });
-  // CSVへの記録は5秒ごと(SDログと同じ 秒%5==0)。画面表示は1秒ごとのまま
-  if (parseInt(dt.slice(17, 19), 10) % 5 === 0 && dt !== lastRecDt) {
-    lastRecDt = dt;
-    rows.push(toSdRow(f));
-  }
+  dirty = true;
 }
 
-// ---- グラフ (時間軸つき・目盛り線つき・表示期間切り替え) ----
+function addTrack(t, lat, lng, spd) {
+  const n = trk.t.length;
+  if (n) {
+    if (t <= trk.t[n - 1]) return;
+    if (!(t - trk.t[n - 1] >= 30e3 || distM(trk.lat[n - 1], trk.lng[n - 1], lat, lng) >= 2)) return;
+  }
+  trk.t.push(t); trk.lat.push(lat); trk.lng.push(lng); trk.spd.push(spd);
+  mapDirty = true;
+}
+
+// ---- SDからの補完行 ----
+// R,datetime,lat,lng,alt,spd,temp,hum,pres,tvoc,lux,sat,hdop,fix
+function onBackfillLine(f) {
+  if (f.length < 14) return;
+  const t = parseDev(f[1]);
+  if (!Number.isFinite(t)) return;
+  const n = parseFloat;
+  let temp = n(f[6]), hum = n(f[7]), pres = n(f[8]);
+  if (!(pres > 0)) temp = hum = pres = NaN;     // SDは取得失敗時に0を書くので、気圧0なら無効扱い
+  bfRows.push({
+    t, spd: n(f[5]), temp, hum, pres, tvoc: n(f[9]), alt: n(f[4]),
+    lat: n(f[2]), lng: n(f[3]), hdop: n(f[12]),
+    fixOk: f[13] === '3D Fix' || f[13] === '2D Fix',
+    s: f.slice(1, 14).join(',') + ','           // 末尾はdist_km(補完行は空欄)
+  });
+  if (bfRows.length % 20 === 0) $('bfInfo').textContent = `履歴を補完中... ${bfRows.length}件`;
+}
+
+function finishBackfill(count) {
+  const rs = bfRows; bfRows = [];
+  rs.sort((a, b) => a.t - b.t);
+  mergeSOA(hist, SERIES, rs.map(r => ({ t: r.t, spd: r.spd, temp: r.temp, hum: r.hum, pres: r.pres, tvoc: r.tvoc, alt: r.alt })));
+  // 軌跡 (ライブと同じ間引きルール)
+  const tn = []; let lt = -Infinity, llat = 0, llng = 0;
+  for (const r of rs) {
+    if (!r.fixOk || !(Math.abs(r.lat) > 1e-4) || !(r.hdop <= 5)) continue;
+    if (lt === -Infinity || r.t - lt >= 30e3 || distM(llat, llng, r.lat, r.lng) >= 2) {
+      tn.push({ t: r.t, lat: r.lat, lng: r.lng, spd: r.spd }); lt = r.t; llat = r.lat; llng = r.lng;
+    }
+  }
+  mergeSOA(trk, ['lat', 'lng', 'spd'], tn);
+  mergeSOA(rows, ['s'], rs.map(r => ({ t: r.t, s: r.s })));
+  $('btnCsv').disabled = rows.t.length === 0;
+  $('bfInfo').textContent = count > 0 ? `履歴を補完しました (${count}件)` : '補完する履歴はありませんでした';
+  dirty = true; mapDirty = true;
+  if (!eco) { drawAll(); updateStats(); updateMap(); }
+}
+
+// ============================================================
+//  CSV (SDカードのログと同じ列・書式 + 末尾に dist_km)
+// ============================================================
+function toSdRow(f) {
+  const [, dt, temp, hum, pres, tvoc, lux, alt, spd, lat, lng, sat, hdop, fix, dist] = f;
+  const num = (v, d) => { const x = parseFloat(v); return (isFinite(x) ? x : 0).toFixed(d); };
+  const fixTxt = fix === '3' ? '3D Fix' : fix === '2' ? '2D Fix' : 'No fix';
+  const luxTxt = isFinite(parseFloat(lux)) ? parseFloat(lux).toFixed(3) : '';
+  return [dt, num(lat, 6), num(lng, 6), num(alt, 1), num(spd, 1),
+          num(temp, 2), num(hum, 1), num(pres, 1), parseInt(tvoc, 10) || 0, luxTxt,
+          parseInt(sat, 10) || 0, num(hdop, 1), fixTxt, num(dist, 2)].join(',');
+}
+function saveCsv() {
+  const head = 'datetime,latitude,longitude,alt_m,spd_kmh,temp_C,hum_pct,pres_hPa,tvoc_ppb,lux,satellites,hdop,fix,dist_km\n';
+  const blob = new Blob([head + rows.s.join('\n') + '\n'], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'envlogger_' + new Date().toISOString().replace(/[:.]/g, '-') + '.csv';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ============================================================
+//  グラフ (時間軸・目盛り線・表示期間切り替え・タップで値表示)
+// ============================================================
 const RANGES = [['1分', 60e3], ['5分', 300e3], ['30分', 1800e3], ['1時間', 3600e3], ['3時間', 10800e3], ['6時間', 21600e3]];
-let rangeMs = 300e3;
 try {
   const r = parseInt(localStorage.getItem('rangeMs'), 10);
   if (RANGES.some(x => x[1] === r)) rangeMs = r;
-} catch (e) { /* 保存できない環境は既定値のまま */ }
+} catch (e) { /* 既定値のまま */ }
 
+// [canvas id, データ名, 色, 単位, ツールチップの小数桁]
 const CHARTS = [
-  ['cSpd', 'spd', '#e8508a'], ['cTemp', 'temp', '#ff8a3d'], ['cHum', 'hum', '#3d9bff'],
-  ['cPres', 'pres', '#8a6bff'], ['cTvoc', 'tvoc', '#2fb36b'], ['cAlt', 'alt', '#b08a3d']
+  ['cSpd', 'spd', '#e8508a', 'km/h', 1], ['cTemp', 'temp', '#ff8a3d', '°C', 2], ['cHum', 'hum', '#3d9bff', '%', 1],
+  ['cPres', 'pres', '#8a6bff', 'hPa', 1], ['cTvoc', 'tvoc', '#2fb36b', 'ppb', 0], ['cAlt', 'alt', '#b08a3d', 'm', 1]
 ];
-// 縦軸が狭くなりすぎてノイズが拡大されないための最小幅
-const MIN_SPAN = { spd: 4, temp: 1, hum: 4, pres: 1, tvoc: 20, alt: 5 };
+const MIN_SPAN = { spd: 4, temp: 1, hum: 4, pres: 1, tvoc: 20, alt: 5 };   // 縦軸が狭くなりすぎない最小幅
 const TIME_STEPS = [10e3, 30e3, 60e3, 300e3, 600e3, 900e3, 1800e3, 3600e3, 7200e3];
+const cursors = {}, cursorTimers = {};
 
-function niceStep(raw) {
-  const p = Math.pow(10, Math.floor(Math.log10(raw)));
-  const m = raw / p;
-  return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * p;
-}
-function lowerBound(arr, x) {
-  let lo = 0, hi = arr.length;
-  while (lo < hi) { const mid = (lo + hi) >> 1; if (arr[mid] < x) lo = mid + 1; else hi = mid; }
-  return lo;
-}
-const p2 = v => String(v).padStart(2, '0');
-
-function drawChart(cv, key, color) {
+function drawChart(cv, key, color, unit, tipDec) {
   const dpr = window.devicePixelRatio || 1;
   const W = Math.round(cv.clientWidth * dpr), H = Math.round(cv.clientHeight * dpr);
+  if (W === 0 || H === 0) return;
   if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
   const ctx = cv.getContext('2d');
   ctx.clearRect(0, 0, W, H);
-  const ml = 42 * dpr, mr = 10 * dpr, mt = 8 * dpr, mb = 22 * dpr;
+  const ml = ML * dpr, mr = MR * dpr, mt = 8 * dpr, mb = 22 * dpr;
   const pw = W - ml - mr, ph = H - mt - mb;
   if (pw <= 0 || ph <= 0) return;
-  const t1 = Date.now(), t0 = t1 - rangeMs;
+  const t1 = nowDev(), t0 = t1 - rangeMs;
   const ink = getComputedStyle(document.body).color;
   ctx.font = `${11 * dpr}px sans-serif`;
 
-  // 表示範囲内の最小・最大
   const ts = hist.t, vs = hist[key];
   const i0 = Math.max(0, lowerBound(ts, t0) - 1);
   let mn = Infinity, mx = -Infinity;
@@ -281,7 +555,7 @@ function drawChart(cv, key, color) {
   const yOf = v => mt + ph * (1 - (v - y0) / (y1 - y0));
   const xOf = t => ml + pw * (t - t0) / rangeMs;
 
-  // 横線 + 縦軸ラベル
+  // 横線 + 縦軸の数値
   ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
   for (let v = y0; v <= y1 + step / 1000; v += step) {
     const y = yOf(v);
@@ -291,17 +565,15 @@ function drawChart(cv, key, color) {
     ctx.fillText(v.toFixed(dec), ml - 5 * dpr, y);
   }
 
-  // 縦線 + 時刻ラベル (ローカル時刻の切りのいい位置)
-  const target = rangeMs / 5;
-  const stepT = TIME_STEPS.find(s => s >= target) || TIME_STEPS[TIME_STEPS.length - 1];
-  const off = new Date().getTimezoneOffset() * 60000;
+  // 縦線 + 時刻 (デバイス時刻=JSTの切りのいい位置)
+  const stepT = TIME_STEPS.find(s => s >= rangeMs / 5) || TIME_STEPS[TIME_STEPS.length - 1];
   ctx.textBaseline = 'alphabetic';
-  for (let t = Math.ceil((t0 - off) / stepT) * stepT + off; t <= t1; t += stepT) {
+  for (let t = Math.ceil(t0 / stepT) * stepT; t <= t1; t += stepT) {
     const x = xOf(t);
     ctx.globalAlpha = 0.12; ctx.strokeStyle = ink; ctx.lineWidth = dpr;
     ctx.beginPath(); ctx.moveTo(x, mt); ctx.lineTo(x, mt + ph); ctx.stroke();
     const d = new Date(t);
-    const label = p2(d.getHours()) + ':' + p2(d.getMinutes()) + (stepT < 60e3 ? ':' + p2(d.getSeconds()) : '');
+    const label = p2(d.getUTCHours()) + ':' + p2(d.getUTCMinutes()) + (stepT < 60e3 ? ':' + p2(d.getUTCSeconds()) : '');
     ctx.globalAlpha = 0.8; ctx.fillStyle = ink;
     ctx.textAlign = x < ml + 18 * dpr ? 'left' : x > W - mr - 18 * dpr ? 'right' : 'center';
     ctx.fillText(label, x, H - 6 * dpr);
@@ -328,10 +600,57 @@ function drawChart(cv, key, color) {
   ctx.stroke();
   if (lastX !== null) { ctx.fillStyle = color; ctx.beginPath(); ctx.arc(lastX, lastY, 3 * dpr, 0, 6.2832); ctx.fill(); }
   ctx.restore();
+
+  // タップした位置の値表示
+  const ct = cursors[cv.id];
+  if (ct !== undefined && ct >= t0 && ct <= t1) {
+    let bi = -1, bd = Infinity;
+    const j = lowerBound(ts, ct);
+    for (const c of [j - 1, j]) {
+      if (c >= 0 && c < ts.length && Number.isFinite(vs[c])) {
+        const d = Math.abs(ts[c] - ct);
+        if (d < bd) { bd = d; bi = c; }
+      }
+    }
+    const ok = bi >= 0 && bd <= 15e3;
+    const cx = ok ? xOf(ts[bi]) : xOf(ct);
+    ctx.globalAlpha = 0.6; ctx.strokeStyle = ink; ctx.lineWidth = dpr; ctx.setLineDash([4 * dpr, 3 * dpr]);
+    ctx.beginPath(); ctx.moveTo(cx, mt); ctx.lineTo(cx, mt + ph); ctx.stroke();
+    ctx.setLineDash([]); ctx.globalAlpha = 1;
+    if (ok) { ctx.fillStyle = color; ctx.beginPath(); ctx.arc(cx, yOf(vs[bi]), 4 * dpr, 0, 6.2832); ctx.fill(); }
+    const d = new Date(ok ? ts[bi] : ct);
+    const text = p2(d.getUTCHours()) + ':' + p2(d.getUTCMinutes()) + ':' + p2(d.getUTCSeconds()) +
+                 (ok ? `  ${vs[bi].toFixed(tipDec)} ${unit}` : '  データなし');
+    ctx.font = `${12 * dpr}px sans-serif`;
+    const bw = ctx.measureText(text).width + 12 * dpr, bh = 18 * dpr;
+    let bx = cx + 8 * dpr;
+    if (bx + bw > W - mr) bx = cx - 8 * dpr - bw;
+    if (bx < ml) bx = ml;
+    ctx.globalAlpha = 0.92; ctx.fillStyle = getComputedStyle(cv.parentElement).backgroundColor;
+    ctx.fillRect(bx, mt + 2 * dpr, bw, bh);
+    ctx.globalAlpha = 1; ctx.strokeStyle = color; ctx.lineWidth = dpr; ctx.strokeRect(bx, mt + 2 * dpr, bw, bh);
+    ctx.fillStyle = ink; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    ctx.fillText(text, bx + 6 * dpr, mt + 2 * dpr + bh / 2);
+  }
 }
 
 function drawAll() {
-  for (const [id, key, color] of CHARTS) drawChart($(id), key, color);
+  if (eco) return;
+  for (const [id, key, color, unit, dec] of CHARTS) drawChart($(id), key, color, unit, dec);
+}
+
+for (const [id, key, color, unit, dec] of CHARTS) {
+  const cv = $(id);
+  const setCursor = ev => {
+    const r = cv.getBoundingClientRect();
+    const frac = Math.min(1, Math.max(0, (ev.clientX - r.left - ML) / (r.width - ML - MR)));
+    cursors[id] = nowDev() - rangeMs + frac * rangeMs;
+    drawChart(cv, key, color, unit, dec);
+    clearTimeout(cursorTimers[id]);
+    cursorTimers[id] = setTimeout(() => { delete cursors[id]; drawChart(cv, key, color, unit, dec); }, 6000);
+  };
+  cv.addEventListener('pointerdown', ev => { cv.setPointerCapture(ev.pointerId); setCursor(ev); });
+  cv.addEventListener('pointermove', ev => { if (ev.buttons) setCursor(ev); });
 }
 
 function renderRange() {
@@ -344,43 +663,150 @@ function renderRange() {
     b.addEventListener('click', () => {
       rangeMs = ms;
       try { localStorage.setItem('rangeMs', String(ms)); } catch (e) { /* 無視 */ }
-      renderRange(); drawAll();
+      renderRange(); drawAll(); updateStats();
     });
     bar.appendChild(b);
   }
 }
 
-// ---- CSV保存 (SDカードのログと同じ列・書式。末尾に dist_km を追加) ----
-// ESP32側 writeLog() と同じ: lat/lng %.6f, alt %.1f, spd %.1f, temp %.2f, hum %.1f, pres %.1f,
-// tvoc 整数, lux %.3f (無ければ空), 衛星数, hdop %.1f, fix 文字列。温湿度・気圧が取れないときは0
-function toSdRow(f) {
-  const [, dt, temp, hum, pres, tvoc, lux, alt, spd, lat, lng, sat, hdop, fix, dist] = f;
-  const num = (v, d) => { const x = parseFloat(v); return (isFinite(x) ? x : 0).toFixed(d); };
-  const fixTxt = fix === '3' ? '3D Fix' : fix === '2' ? '2D Fix' : 'No fix';
-  const luxTxt = isFinite(parseFloat(lux)) ? parseFloat(lux).toFixed(3) : '';
-  return [dt, num(lat, 6), num(lng, 6), num(alt, 1), num(spd, 1),
-          num(temp, 2), num(hum, 1), num(pres, 1), parseInt(tvoc, 10) || 0, luxTxt,
-          parseInt(sat, 10) || 0, num(hdop, 1), fixTxt, num(dist, 2)].join(',');
+// ============================================================
+//  集計 (選択中の表示期間ぶん)
+// ============================================================
+function updateStats() {
+  if (eco) return;
+  const t1 = nowDev(), t0 = t1 - rangeMs;
+  const i0 = lowerBound(hist.t, t0);
+  let spdMax = -Infinity, mvT = 0, mvD = 0;
+  const mm = { temp: [Infinity, -Infinity, 0, 0], pres: [Infinity, -Infinity, 0, 0], alt: [Infinity, -Infinity, 0, 0], tvoc: [Infinity, -Infinity, 0, 0] };
+  for (let i = i0; i < hist.t.length; i++) {
+    const s = hist.spd[i];
+    if (Number.isFinite(s)) {
+      if (s > spdMax) spdMax = s;
+      if (i > 0 && s >= 2) {
+        const dt = hist.t[i] - hist.t[i - 1];
+        if (dt > 0 && dt <= GAP_MS) { mvT += dt; mvD += s * dt / 3.6e6; }
+      }
+    }
+    for (const k in mm) {
+      const v = hist[k][i];
+      if (Number.isFinite(v)) { const a = mm[k]; if (v < a[0]) a[0] = v; if (v > a[1]) a[1] = v; a[2] += v; a[3]++; }
+    }
+  }
+  const f = (v, d) => Number.isFinite(v) && Math.abs(v) !== Infinity ? v.toFixed(d) : '--';
+  const avg = k => mm[k][3] ? mm[k][2] / mm[k][3] : NaN;
+  const items = [
+    ['最高速度', f(spdMax, 1), 'km/h'],
+    ['平均速度(移動中)', mvT > 0 ? f(mvD / (mvT / 3.6e6), 1) : '--', 'km/h'],
+    ['移動時間', mvT > 0 ? fmtDur(mvT) : '--', ''],
+    ['気温 最高 / 最低', `${f(mm.temp[1], 1)} / ${f(mm.temp[0], 1)}`, '°C'],
+    ['気温 平均', f(avg('temp'), 1), '°C'],
+    ['気圧 最高 / 最低', `${f(mm.pres[1], 1)} / ${f(mm.pres[0], 1)}`, 'hPa'],
+    ['標高 最高 / 最低', `${f(mm.alt[1], 0)} / ${f(mm.alt[0], 0)}`, 'm'],
+    ['TVOC 最大', f(mm.tvoc[1], 0), 'ppb']
+  ];
+  $('stats').innerHTML = items.map(([l, v, u]) =>
+    `<div class="card"><div class="label">${l}</div><div><span class="val">${v}</span><span class="unit">${u}</span></div></div>`).join('');
+  const lab = RANGES.find(r => r[1] === rangeMs);
+  $('statsTitle').textContent = lab ? `(直近${lab[0]})` : '';
 }
 
-function saveCsv() {
-  const head = 'datetime,latitude,longitude,alt_m,spd_kmh,temp_C,hum_pct,pres_hPa,tvoc_ppb,lux,satellites,hdop,fix,dist_km\n';
-  const blob = new Blob([head + rows.join('\n') + '\n'], { type: 'text/csv' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = 'envlogger_' + new Date().toISOString().replace(/[:.]/g, '-') + '.csv';
-  a.click();
-  URL.revokeObjectURL(a.href);
+// ============================================================
+//  走行ルートの地図 (Leaflet + OpenStreetMap)
+// ============================================================
+let map = null, poly = null, marker = null, markerAdded = false, follow = true, didFit = false;
+function initMap() {
+  if (map) return;
+  if (typeof L === 'undefined') { $('map').textContent = '地図ライブラリを読み込めません (オンラインで開いてください)'; return; }
+  map = L.map('map').setView([36.0, 138.0], 5);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19, attribution: '© OpenStreetMap contributors'
+  }).addTo(map);
+  poly = L.polyline([], { color: '#e8508a', weight: 4, opacity: 0.9 }).addTo(map);
+  marker = L.circleMarker([0, 0], { radius: 7, color: '#fff', weight: 2, fillColor: '#e8508a', fillOpacity: 1 });
+  map.on('dragstart', () => { follow = false; $('btnFollow').textContent = '追従: OFF'; });
+}
+function updateMap() {
+  if (eco) return;
+  initMap();
+  if (!map) return;
+  mapDirty = false;
+  const segs = []; let cur = [];
+  for (let i = 0; i < trk.t.length; i++) {
+    if (cur.length && trk.t[i] - trk.t[i - 1] > TRK_GAP_MS) { segs.push(cur); cur = []; }
+    cur.push([trk.lat[i], trk.lng[i]]);
+  }
+  if (cur.length) segs.push(cur);
+  poly.setLatLngs(segs);
+  const n = trk.t.length;
+  if (!n) return;
+  const ll = [trk.lat[n - 1], trk.lng[n - 1]];
+  marker.setLatLng(ll);
+  if (!markerAdded) { marker.addTo(map); markerAdded = true; }
+  if (!didFit) { didFit = true; map.fitBounds(poly.getBounds(), { maxZoom: 17, padding: [20, 20] }); }
+  else if (follow) map.panTo(ll);
+}
+
+// ============================================================
+//  省電力表示 / 履歴クリア / 定期処理
+// ============================================================
+function setEco(on) {
+  eco = on;
+  document.body.classList.toggle('eco', on);
+  $('btnEco').textContent = on ? '通常表示' : '省電力表示';
+  try { localStorage.setItem('eco', on ? '1' : '0'); } catch (e) { /* 無視 */ }
+  if (!on) {
+    if (map) map.invalidateSize();
+    drawAll(); updateStats(); mapDirty = true; updateMap();
+  }
+}
+
+let tick = 0;
+function onTick() {
+  tick++;
+  if (!eco) {
+    drawAll();                                  // 切断中も時間軸が進むように1秒ごとに再描画
+    if (tick % 2 === 0) updateStats();
+    if (tick % 5 === 0 && mapDirty) updateMap();
+  }
+  if (tick % 60 === 0) {
+    const cut = nowDev() - MAX_AGE_MS;
+    trimStore(hist, SERIES, cut); trimStore(trk, ['lat', 'lng', 'spd'], cut); trimStore(rows, ['s'], cut);
+    saveState();
+  }
 }
 
 $('btnConn').addEventListener('click', () => {
   if (device && (device.gatt.connected || retryTimer || $('btnConn').textContent === '切断')) disconnect(); else connect();
 });
 $('btnCsv').addEventListener('click', saveCsv);
+$('btnEco').addEventListener('click', () => setEco(!eco));
+$('btnFollow').addEventListener('click', () => {
+  follow = !follow;
+  $('btnFollow').textContent = '追従: ' + (follow ? 'ON' : 'OFF');
+  if (follow) mapDirty = true;
+});
+$('btnFit').addEventListener('click', () => {
+  if (map && trk.t.length) map.fitBounds(poly.getBounds(), { maxZoom: 17, padding: [20, 20] });
+});
+$('btnClear').addEventListener('click', async () => {
+  if (!confirm('保存している履歴(グラフ・軌跡・CSV)をすべて消します。よろしいですか？')) return;
+  resetData(); dirty = false;
+  await deleteSaved();
+  $('btnCsv').disabled = true; $('bfInfo').textContent = '';
+  didFit = false;
+  drawAll(); updateStats(); updateMap();
+});
 window.addEventListener('resize', drawAll);
-renderRange();
-setInterval(drawAll, 1000);   // 切断中も時間軸が進むように1秒ごとに再描画
-drawAll();
+
+(async function init() {
+  await loadState();
+  renderRange();
+  $('btnCsv').disabled = rows.t.length === 0;
+  let ecoSaved = false;
+  try { ecoSaved = localStorage.getItem('eco') === '1'; } catch (e) { /* 無視 */ }
+  if (ecoSaved) setEco(true); else { drawAll(); updateStats(); updateMap(); }
+  setInterval(onTick, 1000);
+})();
 </script>
 </body>
 </html>
